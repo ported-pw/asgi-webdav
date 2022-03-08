@@ -18,13 +18,13 @@ An asynchronous WebDAV server implementation, Support multi-provider, multi-acco
 - Support multi-provider: FileProvider, MemoryProvider
 - Support multi-account and permission control
 - Support optional home directory
+- Support store password in raw/hashlib/LDAP(experimental) mode
 - Full asyncio file IO
 - Passed all [litmus(0.13)](http://www.webdav.org/neon/litmus) test, except 2 warning
 - Browse the file directory in the browser
 - Support HTTP Basic/Digest authentication
 - Support response in Gzip/Brotli
-- Compatible with macOS finder(WebDAVFS/3.0.0)
-- Compatible with Window10 Explorer(Microsoft-WebDAV-MiniRedir/10.0.19043)
+- Compatible with macOS finder and Window10 Explorer
 
 ## Quickstart
 [中文手册](https://rexzhang.github.io/asgi-webdav/zh/)
@@ -59,12 +59,11 @@ docker run --restart always -p 0.0.0.0:8000:8000 \
 - SQL database provider
 - PROPFIND support DAVDepth.infinity
 - Test big(1GB+) file in MemoryProvider
-- disable @eaDir at anywhere?
 - display server info in page `/_/admin` or `/_/`
-- default user have not admin privileges
 - OpenLDAP
 - Fail2ban(docker)
 - NFSProvider
+- logout at the web page
 
 ## Related Projects
 - https://github.com/bootrino/reactoxide

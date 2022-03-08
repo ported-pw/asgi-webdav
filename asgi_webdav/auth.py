@@ -1,24 +1,15 @@
-"""
-Ref:
-- https://en.wikipedia.org/wiki/Basic_access_authentication
-- https://en.wikipedia.org/wiki/Digest_access_authentication
-- https://datatracker.ietf.org/doc/html/rfc2617
-- https://datatracker.ietf.org/doc/html/rfc7616
-- https://datatracker.ietf.org/doc/html/rfc7617
-- https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Authentication
-- https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/Digest
-
-- https://github.com/dimagi/python-digest/blob/master/python_digest/__init__.py
-- https://github.com/psf/requests/blob/master/requests/auth.py
-- https://gist.github.com/dayflower/5828503
-"""
 import binascii
 import re
 import hashlib
 import asyncio
+import enum
+from typing import List
 from base64 import b64decode
 from uuid import uuid4
 from logging import getLogger
+
+import bonsai
+from bonsai import errors as bonsai_exception
 
 from asgi_webdav.constants import DAVUser
 from asgi_webdav.exception import AuthFailedException
@@ -28,6 +19,144 @@ from asgi_webdav.response import DAVResponse
 
 
 logger = getLogger(__name__)
+
+"""
+Ref:
+- https://en.wikipedia.org/wiki/Basic_access_authentication
+- https://en.wikipedia.org/wiki/Digest_access_authentication
+- https://datatracker.ietf.org/doc/html/rfc2617
+    - HTTP Authentication: Basic and Digest Access Authentication
+- https://datatracker.ietf.org/doc/html/rfc7616
+    - HTTP Digest Access Authentication
+- https://datatracker.ietf.org/doc/html/rfc7617
+    - The 'Basic' HTTP Authentication Scheme
+- https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Authentication
+- https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/Digest
+
+- https://github.com/dimagi/python-digest/blob/master/python_digest/__init__.py
+- https://github.com/psf/requests/blob/master/requests/auth.py
+- https://gist.github.com/dayflower/5828503
+
+LDAP
+- https://www.openldap.org/doc/admin24/security.html
+"""
+
+
+class DAVPasswordType(enum.Enum):
+    RAW = enum.auto()
+    HASHLIB = enum.auto()
+    DIGEST = enum.auto()
+    LDAP = enum.auto()
+
+
+DAV_PASSWORD_TYPE_MAPPING = {
+    "hashlib": (4, DAVPasswordType.HASHLIB),
+    "digest": (3, DAVPasswordType.DIGEST),
+    "ldap": (5, DAVPasswordType.LDAP),
+}
+
+
+class DAVPassword:
+    password: str
+
+    type: DAVPasswordType
+    data: list[str]
+
+    def _parser_password_string(self) -> (DAVPasswordType, list[str]):
+        m = re.match(r"^<(?P<sign>\w+)>(?P<split_char>[:#$&|])", self.password)
+        if m is None:
+            self.type = DAVPasswordType.RAW
+            self.data = [self.password]
+            return
+
+        sign = m.group("sign")
+        split_char = m.group("split_char")
+        if sign not in DAV_PASSWORD_TYPE_MAPPING:
+            raise AuthFailedException(
+                "Wrong password format in Config:{}".format(self.password)  # TODO
+            )
+
+        data = self.password.split(split_char)
+        if len(data) != DAV_PASSWORD_TYPE_MAPPING[sign][0]:
+            raise AuthFailedException(
+                "Wrong password format in Config:{}".format(self.password)  # TODO
+            )
+
+        self.type = DAV_PASSWORD_TYPE_MAPPING[sign][1]
+        self.data = data
+        return
+
+    def __init__(self, password: str):
+        self.password = password
+
+        self._parser_password_string()
+
+    def check_hashlib_password(self, password: str) -> (bool, str | None):
+        """
+        password string format: "<hashlib>:algorithm:salt:hex-digest-string"
+        hex-digest-string: hashlib.new(algorithm, b"{salt}:{password}").hexdigest()
+        """
+        try:
+            hash_str = hashlib.new(
+                self.data[1],
+                "{}:{}".format(self.data[2], password).encode("utf-8"),
+            ).hexdigest()
+        except ValueError as e:
+            return False, str(e)
+
+        if hash_str == self.data[3]:
+            return True, None
+
+        return False, None
+
+    async def check_ldap_password(self, password: str) -> (bool, str | None):
+        """ "
+        "<ldap>#1#ldaps:/your.domain.com#SIMPLE#uid=user-ldap,cn=users,dc=rexzhang,dc=myds,dc=me"
+        """
+        if self.data[1] != "1":
+            return False, "Wrong password format in Config"
+
+        client = bonsai.LDAPClient(self.data[2])
+        client.set_credentials(self.data[3], user=self.data[4], password=password)
+        try:
+            conn = await client.connect(is_async=True)
+            # result = await conn.search(
+            #     base=ldap_username,
+            #     scope=2,
+            #     attrlist=["uid", "memberOf", "userPassword"],
+            # )
+            # if len(result) != 1:
+            #     logger.warning("LDAP search failed")
+            #     return False
+            conn.close()
+
+        except bonsai_exception.AuthenticationError:
+            return False, "LDAP Authentication Error"
+        except bonsai_exception.AuthMethodNotSupported:
+            return False, "LDAP auth method not supported"
+
+        return True, None
+
+    def check_digest_password(self, username: str, password: str) -> (bool, str | None):
+        """
+        password string format: "<digest>:{realm}:{HA1}"
+        HA1: hashlib.new("md5", b"{username}:{realm}:{password}").hexdigest()
+        """
+        try:
+            hash_str = hashlib.new(
+                "md5",
+                "{}:{}:{}".format(username, self.data[1], password).encode("utf-8"),
+            ).hexdigest()
+        except ValueError as e:
+            return False, str(e)
+
+        if hash_str == self.data[2]:
+            return True, None
+
+        return False, None
+
+    def __repr__(self):
+        return "{}|{}".format(self.type, self.data)
 
 
 class HTTPAuthAbc:
@@ -75,7 +204,7 @@ class HTTPBasicAuth(HTTPAuthAbc):
     @staticmethod
     def parser_auth_header_data(auth_header_data: bytes) -> (str, str):
         try:
-            data = b64decode(auth_header_data).decode("utf-8")  # TODO try
+            data = b64decode(auth_header_data).decode("utf-8")
         except binascii.Error:
             raise AuthFailedException()
 
@@ -84,6 +213,47 @@ class HTTPBasicAuth(HTTPAuthAbc):
             raise AuthFailedException()
 
         return data[:index], data[index + 1 :]
+
+    @staticmethod
+    async def check_password(user: DAVUser, password: str) -> bool:
+        pw_obj = DAVPassword(user.password)
+
+        match pw_obj.type:
+            case DAVPasswordType.RAW:
+                if password == user.password:
+                    return True
+
+                valid, message = False, None
+
+            case DAVPasswordType.HASHLIB:
+                valid, message = pw_obj.check_hashlib_password(password)
+
+            case DAVPasswordType.DIGEST:
+                valid, message = pw_obj.check_digest_password(user.username, password)
+
+            case DAVPasswordType.LDAP:
+                valid, message = await pw_obj.check_ldap_password(password)
+
+            case _:
+                valid, message = False, None
+
+        if valid:
+            return True
+
+        if message is None:
+            message = "Password verification failed, username:{}, password:{}".format(
+                user.username, user.password
+            )
+            logger.debug(message)  # TODO debug?info? config in file?
+
+        else:
+            logger.error(
+                "{}, , username:{}, password:{}".format(
+                    message, user.username, user.password
+                )
+            )
+
+        return False
 
 
 DIGEST_AUTHORIZATION_PARAMS = {
@@ -164,11 +334,9 @@ class HTTPDigestAuth(HTTPAuthAbc):
         user: DAVUser,
         digest_auth_data: dict[str, str],
     ) -> bytes:
-        ha1, ha2 = self.build_ha1_ha2_digest(
-            username=user.username,
-            password=user.password,
-            method=request.method,
-            uri=digest_auth_data.get("uri"),  # TODO!!!,
+        ha1 = self.build_ha1_digest(user)
+        ha2 = self.build_ha2_digest(
+            method=request.method, uri=digest_auth_data.get("uri")
         )
         rspauth = self.build_md5_digest(
             [
@@ -225,16 +393,28 @@ class HTTPDigestAuth(HTTPAuthAbc):
     def build_md5_digest(data: list[str]) -> str:
         return hashlib.new("md5", ":".join(data).encode("utf-8")).hexdigest()
 
-    def build_ha1_ha2_digest(
-        self, username: str, password: str, method: str, uri: str
-    ) -> (str, str):
-        # HA1 = MD5(username:realm:password)
-        ha1 = self.build_md5_digest([username, self.realm, password])
+    def build_ha1_digest(self, user: DAVUser) -> str:
+        """
+        HA1 = MD5(username:realm:password)
+        """
+        pw_obj = DAVPassword(user.password)
+        match pw_obj.type:
+            case DAVPasswordType.RAW:
+                return self.build_md5_digest([user.username, self.realm, user.password])
 
-        # HA2 = MD5(method:digestURI)
-        ha2 = self.build_md5_digest([method, uri])
+            case DAVPasswordType.DIGEST:
+                return pw_obj.data[2]
 
-        return ha1, ha2
+            case _:
+                raise AuthFailedException(
+                    "Wrong password format in Config:{}".format(user.password)
+                )
+
+    def build_ha2_digest(self, method: str, uri: str) -> str:
+        """
+        HA2 = MD5(method:digestURI)
+        """
+        return self.build_md5_digest([method, uri])
 
     def build_request_digest(
         self,
@@ -242,11 +422,9 @@ class HTTPDigestAuth(HTTPAuthAbc):
         user: DAVUser,
         digest_auth_data: dict[str, str],
     ) -> str:
-        ha1, ha2 = self.build_ha1_ha2_digest(
-            username=user.username,
-            password=user.password,
-            method=request.method,
-            uri=digest_auth_data.get("uri"),  # TODO!!!,
+        ha1 = self.build_ha1_digest(user)
+        ha2 = self.build_ha2_digest(
+            method=request.method, uri=digest_auth_data.get("uri")
         )
 
         if digest_auth_data.get("qop") == "auth":
@@ -286,7 +464,7 @@ MESSAGE_401_TEMPLATE = """<!DOCTYPE html>
 
 class DAVAuth:
     realm = "ASGI-WebDAV"
-    user_mapping: dict[str, DAVUser] = dict()  # username: password
+    user_mapping: dict[str, DAVUser] = dict()
 
     def __init__(self, config: Config):
         self.config = config
@@ -294,8 +472,8 @@ class DAVAuth:
         for config_account in config.account_mapping:
             self.upsert_user(config_account)
 
-        self.basic_auth = HTTPBasicAuth(realm=self.realm)
-        self.digest_auth = HTTPDigestAuth(realm=self.realm, secret=uuid4().hex)
+        self.http_basic_auth = HTTPBasicAuth(realm=self.realm)
+        self.http_digest_auth = HTTPDigestAuth(realm=self.realm, secret=uuid4().hex)
 
     def upsert_user(self, config_account: User):
         """
@@ -316,88 +494,7 @@ class DAVAuth:
         logger.info("Remove user: {}".format(user))
 
     def list_users(self) -> List[str]:
-        return self.user_mapping.keys()
-
-    @staticmethod
-    def _check_hashlib_password(password_in_config, password: str) -> bool:
-        """
-        password string format: "hashlib:algorithm:salt:hex-digest-string"
-        hex-digest-string: hashlib.new(algorithm, b"{salt}:{password}").hexdigest()
-        """
-
-        # parser password string
-        algorithm_salt_hash_str = password_in_config[8:]
-
-        index = algorithm_salt_hash_str.find(":")
-        if index == -1:
-            raise AuthFailedException(
-                "wrong password format in config:{}".format(password_in_config)
-            )
-        algorithm = algorithm_salt_hash_str[:index]
-        salt_hash_str = algorithm_salt_hash_str[index + 1 :]
-
-        index = salt_hash_str.find(":")
-        if index == -1:
-            raise AuthFailedException(
-                "wrong password format in config:{}".format(password_in_config)
-            )
-        salt = salt_hash_str[:index]
-        hash_str = salt_hash_str[index + 1 :]
-
-        # create hash sting
-        try:
-            new_hash_str = hashlib.new(
-                algorithm, "{}:{}".format(salt, password).encode("utf-8")
-            ).hexdigest()
-        except ValueError as e:
-            raise AuthFailedException(e)
-
-        if hash_str == new_hash_str:
-            return True
-
-        return False
-
-    @staticmethod
-    def _check_digest_password(password_in_config, password: str) -> bool:
-        """
-        password string format: "digest:realm:HA1"
-        HA1: hashlib.new("md5", b"{username}:{realm}:{password}").hexdigest()
-        """
-        return False
-
-    def is_correct_password(self, username: str, password: str) -> bool:
-        user = None
-        for item in self.config.account_mapping:
-            if item.username == username:
-                user = item
-
-        if user is None:
-            return False
-
-        if user.password.startswith("hashlib:"):
-            # hashlib
-            if self._check_hashlib_password(user.password, password):
-                return True
-            else:
-                return False
-
-        elif user.password.startswith("digest"):
-            # digest
-            if self._check_digest_password(user.password, password):
-                return True
-            else:
-                return False
-
-        elif user.password.startswith("openldap:"):
-            # OpenLDAP
-            # password string format: openldap:search-base
-            raise NotImplementedError
-
-        # RAW
-        if password == user.password:
-            return True
-
-        return False
+        return list(self.user_mapping.keys())
 
     async def pick_out_user(self, request: DAVRequest) -> (DAVUser | None, str):
         authorization_header = request.headers.get(b"authorization")
@@ -411,36 +508,37 @@ class DAVAuth:
         auth_header_type = authorization_header[:index]
         auth_header_data = authorization_header[index + 1 :]
 
-        # Basic
-        if self.basic_auth.is_credential(auth_header_type):
+        # HTTP Basic Auth
+        if self.http_basic_auth.is_credential(auth_header_type):
             request.authorization_method = "Basic"
 
-            user = await self.basic_auth.get_user_from_cache(auth_header_data)
+            user = await self.http_basic_auth.get_user_from_cache(auth_header_data)
             if user is not None:
                 return user, ""
 
             try:
-                username, password = self.basic_auth.parser_auth_header_data(
-                    auth_header_data
-                )
+                (
+                    username,
+                    request_password,
+                ) = self.http_basic_auth.parser_auth_header_data(auth_header_data)
             except AuthFailedException:
-                return None, "no permission"  # TODO
-
-            if not self.is_correct_password(username, password):
                 return None, "no permission"  # TODO
 
             user = self.user_mapping.get(username)
             if user is None:
-                return None, "no permission,!!!"  # TODO
+                return None, "no permission"  # TODO
 
-            await self.basic_auth.update_user_to_cache(authorization_header, user)
+            if not await self.http_basic_auth.check_password(user, request_password):
+                return None, "no permission"  # TODO
+
+            await self.http_basic_auth.update_user_to_cache(auth_header_data, user)
             return user, ""
 
-        # Digest
-        if self.digest_auth.is_credential(auth_header_type):
+        # HTTP Digest Auth
+        if self.http_digest_auth.is_credential(auth_header_type):
             request.authorization_method = "Digest"
 
-            digest_auth_data = self.digest_auth.authorization_str_parser_to_data(
+            digest_auth_data = self.http_digest_auth.authorization_str_parser_to_data(
                 (authorization_header[7:].decode("utf-8"))
             )
             if len(DIGEST_AUTHORIZATION_PARAMS - set(digest_auth_data.keys())) > 0:
@@ -450,7 +548,7 @@ class DAVAuth:
             if user is None:
                 return None, "no permission"
 
-            expected_request_digest = self.digest_auth.build_request_digest(
+            expected_request_digest = self.http_digest_auth.build_request_digest(
                 request=request,
                 user=user,
                 digest_auth_data=digest_auth_data,
@@ -467,7 +565,7 @@ class DAVAuth:
             # macOS 11.4 finder supported
             #   WebDAVFS/3.0.0 (03008000) Darwin/20.5.0 (x86_64)
             request.authorization_info = (
-                self.digest_auth.make_response_authentication_info_string(
+                self.http_digest_auth.make_response_authentication_info_string(
                     request=request,
                     user=user,
                     digest_auth_data=digest_auth_data,
@@ -497,10 +595,10 @@ class DAVAuth:
                 enable_digest = False
 
         if enable_digest:
-            challenge_string = self.digest_auth.make_auth_challenge_string()
+            challenge_string = self.http_digest_auth.make_auth_challenge_string()
             logger.debug("response Digest auth challenge")
         else:
-            challenge_string = self.basic_auth.make_auth_challenge_string()
+            challenge_string = self.http_basic_auth.make_auth_challenge_string()
             logger.debug("response Basic auth challenge")
 
         return DAVResponse(

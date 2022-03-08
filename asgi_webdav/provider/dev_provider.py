@@ -24,14 +24,11 @@ logger = getLogger(__name__)
 class DAVProvider:
     def __init__(
         self,
-        config: Config,
         prefix: DAVPath,
         uri: str,
         home_dir: bool = False,
         read_only: bool = False,
     ):
-        self.config = config
-
         self.prefix = prefix
         self.uri = uri
 

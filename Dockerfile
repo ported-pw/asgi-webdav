@@ -16,14 +16,20 @@ ENV GID=1000
 
 RUN \
     # install depends
-    apk add --no-cache --virtual .build-deps build-base libffi-dev \
+    apk add --no-cache --virtual .build-deps build-base libffi-dev openldap-dev \
     && pip install --no-cache-dir -r /app/requirements/docker.txt \
     && apk del .build-deps \
     && find /usr/local/lib/python*/ -type f -name '*.py[cod]' -delete \
+    # LDAP client's depends
+    && apk add libsasl libldap \
     # create non-root user
     && apk add --no-cache shadow \
     && addgroup -S -g $GID prisoner \
     && adduser -S -D -G prisoner -u $UID prisoner \
+    # fix libexpat bug:
+    #   out of memory: line 1, column 0
+    #   https://bugs.launchpad.net/ubuntu/+source/python-xmltodict/+bug/1961800
+    && apk add 'expat>2.4.7' \
     # prepare
     && mkdir /data
 

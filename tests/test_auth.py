@@ -4,22 +4,22 @@ import pytest
 
 from asgi_webdav.constants import DAVPath, DAVUser
 from asgi_webdav.config import update_config_from_obj, get_config
-from asgi_webdav.auth import DAVAuth
+from asgi_webdav.auth import DAVPassword, DAVPasswordType, DAVAuth
 from asgi_webdav.request import DAVRequest
 
-USERNAME1 = "user1"
-PASSWORD1 = "pass1"
+USERNAME = "username"
+PASSWORD = "password"
+HASHLIB_USER = "user-hashlib"
 
-config_data = {
-    "account_mapping": [
-        {"username": USERNAME1, "password": PASSWORD1, "permissions": list()}
-    ]
-}
 
 basic_authorization = b"Basic " + b64encode(
-    "{}:{}".format(USERNAME1, PASSWORD1).encode("utf-8")
+    "{}:{}".format(USERNAME, PASSWORD).encode("utf-8")
 )
 basic_authorization_bad = b"Basic bad basic_authorization"
+
+
+def get_basic_authorization(username, password) -> bytes:
+    return b"Basic " + b64encode("{}:{}".format(username, password).encode("utf-8"))
 
 
 def fake_call():
@@ -33,27 +33,53 @@ request = DAVRequest(
 )
 
 
+def test_dev_password_class():
+    pw_obj = DAVPassword("password")
+    assert pw_obj.type == DAVPasswordType.RAW
+
+    pw_obj = DAVPassword(
+        "<hashlib>:sha256:salt:291e247d155354e48fec2b579637782446821935fc96a5a08a0b7885179c408b"
+    )
+    assert pw_obj.type == DAVPasswordType.HASHLIB
+
+    pw_obj = DAVPassword("<digest>:ASGI-WebDAV:c1d34f1e0f457c4de05b7468d5165567")
+    assert pw_obj.type == DAVPasswordType.DIGEST
+
+    pw_obj = DAVPassword(
+        "<ldap>#1#ldaps://rexzhang.myds.me#SIMPLE#"
+        "uid=user-ldap,cn=users,dc=rexzhang,dc=myds,dc=me"
+    )
+    assert pw_obj.type == DAVPasswordType.LDAP
+
+
 @pytest.mark.asyncio
 async def test_basic_access_authentication():
+    config_data = {
+        "account_mapping": [
+            {"username": USERNAME, "password": PASSWORD, "permissions": list()},
+            {
+                "username": HASHLIB_USER,
+                "password": "<hashlib>:sha256:salt:"
+                "291e247d155354e48fec2b579637782446821935fc96a5a08a0b7885179c408b",
+                "permissions": list(),
+            },
+        ]
+    }
     update_config_from_obj(config_data)
     dav_auth = DAVAuth(get_config())
 
-    request.headers.update(
-        {
-            b"authorization": basic_authorization,
-        }
-    )
+    request.headers[b"authorization"] = get_basic_authorization(USERNAME, PASSWORD)
     user, message = await dav_auth.pick_out_user(request)
     print(basic_authorization)
     print(user)
     print(message)
     assert isinstance(user, DAVUser)
 
-    request.headers.update(
-        {
-            b"authorization": basic_authorization_bad,
-        }
-    )
+    request.headers[b"authorization"] = get_basic_authorization(HASHLIB_USER, PASSWORD)
+    user, message = await dav_auth.pick_out_user(request)
+    assert isinstance(user, DAVUser)
+
+    request.headers[b"authorization"] = basic_authorization_bad
     user, message = await dav_auth.pick_out_user(request)
     print(user)
     print(message)
@@ -61,8 +87,8 @@ async def test_basic_access_authentication():
 
 
 def test_verify_permission():
-    username = USERNAME1
-    password = PASSWORD1
+    username = USERNAME
+    password = PASSWORD
     admin = False
 
     # "+"
