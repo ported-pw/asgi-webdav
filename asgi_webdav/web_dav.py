@@ -125,9 +125,14 @@ class WebDAV:
             home_dir=pm.home_dir,
         )
         self.prefix_provider_mapping[pm.prefix] = ppi
-        self.prefix_provider_mapping = {k: v for k, v in sorted(
-            self.prefix_provider_mapping.items(), key=lambda x: x.prefix_weight, reverse=True
-        )}
+        self.prefix_provider_mapping = {
+            k: v
+            for k, v in sorted(
+                self.prefix_provider_mapping.items(),
+                key=lambda x: x[1].prefix_weight,
+                reverse=True,
+            )
+        }
         logger.info("Upsert mapping prefix: {}".format(ppi))
 
     def match_provider(self, request: DAVRequest) -> DAVProvider | None:
