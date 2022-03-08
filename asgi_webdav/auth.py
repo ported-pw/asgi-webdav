@@ -22,7 +22,7 @@ from logging import getLogger
 
 from asgi_webdav.constants import DAVUser
 from asgi_webdav.exception import AuthFailedException
-from asgi_webdav.config import Config
+from asgi_webdav.config import Config, User
 from asgi_webdav.request import DAVRequest
 from asgi_webdav.response import DAVResponse
 
@@ -292,18 +292,31 @@ class DAVAuth:
         self.config = config
 
         for config_account in config.account_mapping:
-            user = DAVUser(
-                username=config_account.username,
-                password=config_account.password,
-                permissions=config_account.permissions,
-                admin=config_account.admin,
-            )
-
-            self.user_mapping[config_account.username] = user
-            logger.info("Register User: {}".format(user))
+            self.upsert_user(config_account)
 
         self.basic_auth = HTTPBasicAuth(realm=self.realm)
         self.digest_auth = HTTPDigestAuth(realm=self.realm, secret=uuid4().hex)
+
+    def upsert_user(self, config_account: User):
+        """
+        Adds or updates a user
+        """
+        user = DAVUser(
+            username=config_account.username,
+            password=config_account.password,
+            permissions=config_account.permissions,
+            admin=config_account.admin,
+        )
+
+        self.user_mapping[config_account.username] = user
+        logger.info("Upsert user: {}".format(user))
+
+    def remove_user(self, username: str):
+        user = self.user_mapping.pop(username)
+        logger.info("Remove user: {}".format(user))
+
+    def list_users(self) -> List[str]:
+        return self.user_mapping.keys()
 
     @staticmethod
     def _check_hashlib_password(password_in_config, password: str) -> bool:

@@ -1,5 +1,5 @@
 import asyncio
-from typing import Optional
+from typing import Optional, Dict
 from dataclasses import dataclass
 from copy import copy
 from logging import getLogger
@@ -11,7 +11,7 @@ from asgi_webdav.constants import (
     DAVDepth,
     DAVTime,
 )
-from asgi_webdav.config import Config
+from asgi_webdav.config import Config, Provider
 from asgi_webdav.request import DAVRequest
 
 from asgi_webdav.provider.dev_provider import DAVProvider
@@ -88,7 +88,8 @@ class PrefixProviderInfo:
 
 
 class WebDAV:
-    prefix_provider_mapping: list = list()
+    # config prefix ('Provider.prefix' -> PrefixProviderInfo
+    prefix_provider_mapping: Dict[str, PrefixProviderInfo] = dict()
 
     _dir_file_ignore_lock: asyncio.Lock
     _dir_file_ignore_ua_to_rule_mapping: dict[str:str]
@@ -96,33 +97,7 @@ class WebDAV:
     def __init__(self, config: Config):
         # init prefix => provider
         for pm in config.provider_mapping:
-            if pm.uri.startswith("file://"):
-                provider_factory = FileSystemProvider
-
-            elif pm.uri.startswith("memory://"):
-                provider_factory = MemoryProvider
-
-            else:
-                raise
-
-            provider = provider_factory(
-                config=config,
-                prefix=DAVPath(pm.prefix),
-                uri=pm.uri,
-                home_dir=pm.home_dir,
-            )
-            ppi = PrefixProviderInfo(
-                prefix=DAVPath(pm.prefix),
-                prefix_weight=len(pm.prefix),
-                provider=provider,
-                home_dir=pm.home_dir,
-            )
-            self.prefix_provider_mapping.append(ppi)
-            logger.info("Mapping Prefix: {}".format(ppi))
-
-        self.prefix_provider_mapping.sort(
-            key=lambda x: getattr(x, "prefix_weight"), reverse=True
-        )
+            self.upsert_provider(pm)
 
         # init dir browser config
         self.enable_dir_browser = config.enable_dir_browser
@@ -131,12 +106,47 @@ class WebDAV:
         self._dir_file_ignore_ua_to_rule_mapping = dict()
         self._dir_file_ignore_lock = asyncio.Lock()
 
+    def remove_provider(self, prefix: str):
+        try:
+            ppi = self.prefix_provider_mapping.pop(prefix)
+            logger.info("Remove mapping prefix: {}".format(ppi))
+        except KeyError:
+            pass
+
+    def upsert_provider(self, pm: Provider):
+        if pm.uri.startswith("file://"):
+            provider_factory = FileSystemProvider
+
+        elif pm.uri.startswith("memory://"):
+            provider_factory = MemoryProvider
+
+        else:
+            raise
+
+        provider = provider_factory(
+            config=config,
+            prefix=DAVPath(pm.prefix),
+            uri=pm.uri,
+            home_dir=pm.home_dir,
+        )
+        ppi = PrefixProviderInfo(
+            prefix=DAVPath(pm.prefix),
+            prefix_weight=len(pm.prefix),
+            provider=provider,
+            home_dir=pm.home_dir,
+        )
+        self.prefix_provider_mapping[pm.prefix] = ppi
+        self.prefix_provider_mapping = {k: v for k, v in sorted(
+            self.prefix_provider_mapping.items(), key=lambda x: x.prefix_weight, reverse=True
+        )}
+        logger.info("Upsert mapping prefix: {}".format(ppi))
+
     def match_provider(self, request: DAVRequest) -> Optional[DAVProvider]:
         weight = None
         provider = None
 
         # match provider
-        for ppi in self.prefix_provider_mapping:
+        for ppi in self.prefix_provider_mapping.values():
             if not request.src_path.startswith(ppi.prefix):
                 continue
 
@@ -222,7 +232,7 @@ class WebDAV:
 
     def get_depth_1_child_provider(self, prefix: DAVPath) -> list[DAVProvider]:
         providers = list()
-        for ppm in self.prefix_provider_mapping:
+        for ppm in self.prefix_provider_mapping.values():
             if ppm.prefix.startswith(prefix):
                 if ppm.prefix.get_child(prefix).count == 1:
                     providers.append(ppm.provider)
